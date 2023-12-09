@@ -2,6 +2,7 @@
 # Background member management for ZweefApp.
 # =============================================
 import os
+import random
 import requests
 import json
 from dotenv import load_dotenv
@@ -12,14 +13,14 @@ from collections import defaultdict
 from util.send_email import send
 from ics import Calendar
 import os
-
-
+import time
 import locale
 
 class ZweefApp:
     
     config = {
         'config_user_id': 121,
+        'production': True,
         'auth': {
             'user_token': False,
             'api_token': False,
@@ -38,16 +39,18 @@ class ZweefApp:
     dayid2messageid = {}
     SS_pax_registrations = False
     
-    def __init__(self):
+    def __init__(self, production=False):
         """Initialises main object."""
         self.initialise_config()
         self.load_members()
+        
+        # Makes requests slower, to not occupy the main servers so much.
+        self.config['production'] = production
         
         # Set the locale to Dutch
         locale.setlocale(locale.LC_TIME, 'nl_NL')
 
         logging.debug('Initialised ZweefApp object.')
-        return
     
     def _user_headers(self):
         """Generates headers for admin-user requests to internal API's.
@@ -83,7 +86,6 @@ class ZweefApp:
         
         if self.config['auth']['api_token']:
             headers['X-API-KEY'] = f"{self.config['auth']['api_token']}"
-            print(headers)
            
         return headers
     
@@ -109,9 +111,6 @@ class ZweefApp:
     def refresh(self):
         """Main entrypoint for refreshing webservices and information points."""
         self.process_flying_days()
-        self.process_saas_pax()
-        
-        return
         
     def load_members(self):
         """
@@ -140,8 +139,8 @@ class ZweefApp:
         yesterday = dt.now() - timedelta(days=1)
         days = [day for day in days if dt.strptime(day['datum'], "%Y-%m-%d") > yesterday]
         
-        future = dt.now() + timedelta(days=14)
-        days = [day for day in days if dt.strptime(day['datum'], "%Y-%m-%d") < future]
+        # future = dt.now() + timedelta(days=14)
+        # days = [day for day in days if dt.strptime(day['datum'], "%Y-%m-%d") < future]
         
         days = sorted(days, key=lambda day: dt.strptime(day['datum'], "%Y-%m-%d"))
         
@@ -149,6 +148,9 @@ class ZweefApp:
         signups_cache = {}
         signups_student_week = defaultdict(lambda: defaultdict(list))
         for day in days:
+            
+            if self.config['production']:
+                time.sleep(1)
             
             # Parse datum
             day['datum'] = dt.strptime(day['datum'], "%Y-%m-%d")
@@ -161,7 +163,7 @@ class ZweefApp:
             ).json()
             
             # Cache all existing messages placed by bot.
-            botmsgs = [message for message in response['messages'] if 'AutoVandaag:' in message['message']]
+            botmsgs = [message for message in response['messages'] if 'Vandaag:' in message['message']]
             if len(botmsgs) > 0:
                 self.dayid2messageid[day['dag_id']] = botmsgs[0]['id']
             
@@ -186,6 +188,7 @@ class ZweefApp:
         for day in days:
             
             valid_signups = signups_cache[day['dag_id']]
+            day_date = day['datum']
             
             # Students are DBO'ers only. Signup moment is important for giving importance.
             students = [signup for signup in valid_signups if 'solist' in signup['vlieger']['group_names']]
@@ -203,17 +206,8 @@ class ZweefApp:
             logging.debug(f"up{len(valid_signups)} dbo{len(students)}, instr_ok{len(instr_ok)}/nok{len(instr_nok)}.")
             
             # ========================
-            # PAX and Dagbericht Part
-            # ========================
-            
-            
-            
-            
-            
-            # ========================
             # DBO Student Logic Part
             # ========================
-            day_date = day['datum']
             day_DBO_signup_before = day_date - timedelta(days=7)
             day_isweekend = day_date.isoweekday() in [6, 7]
             day_DBO_signup_thu18h = day_date - timedelta(days=1, hours=6)
@@ -222,6 +216,7 @@ class ZweefApp:
                 
             # Logic for signing up students on time and per instructor. 
             students_processed = 0
+            students_accepted = 0
             for signup in students:
                 students_processed += 1
                 
@@ -255,7 +250,17 @@ class ZweefApp:
                     and signup['date_aangemeld'] is not priority_signup):
                     self._remove_aanmelding(reason='DBO_WEEKND_QUOTA', **args)
                     continue
+                
+                students_accepted += 1
     
+            # ========================
+            # PAX and Dagbericht Part
+            # ========================
+            pax = self.get_saas_pax(day_date)
+            # logging.info(pax)
+            n_pax = sum([len(slot['bookings']) for slot in pax['slots']])
+            self.set_day_message(day['dag_id'], day_date, f'{n_pax} pax, zie nu.zweef.nl ({random.randint(1000, 9999)}).')
+            
     def _remove_aanmelding(self, day_id, day_date, lid_id, reason):
         
         # Validate reasons.
@@ -290,7 +295,7 @@ class ZweefApp:
 
     def set_day_message(self, day_id, day_date, message):
         id = self.dayid2messageid.get(day_id, None)
-        prefix = 'AutoVandaag:'
+        prefix = 'Vandaag'
         json_data = {
             'message': f"{prefix} {message}",
             'as_email': False,
@@ -298,13 +303,18 @@ class ZweefApp:
             'dag_id': day_id,
             'datum': dt.strftime(day_date, "%Y-%m-%d"),
         }
+        
+        logging.debug(json_data)
 
-        requests.post(self.config['eps']['ext'] + 'aanmeldingen/message.json',
+        kek = requests.post(self.config['eps']['int'] + 'aanmeldingen/message.json',
             headers=self._user_headers(),
             json=json_data,
         )
+        
+        print(kek)
+        print(kek.text)
 
-    def process_saas_pax(self, day_date):
+    def get_saas_pax(self, day_date):
 
         # Request items for calendar 74955, which is the PAX calendar.
         url = "https://www.supersaas.com/api/range/74955.json"
@@ -315,14 +325,13 @@ class ZweefApp:
             'to': dt.strftime((day_date+timedelta(days=1)), "%Y-%m-%d"),
         }
         response = requests.get(url, params=params).json()
-        print(response)
+        return response
 
 if __name__ == '__main__':
     
     logging.basicConfig()
     logging.getLogger().setLevel(logging.DEBUG)
     
-    zweef = ZweefApp()
-    # zweef.refresh()
-    zweef.process_saas_pax(dt(2024, 4, 17))
+    zweef = ZweefApp(production=False)
+    zweef.refresh()
     
